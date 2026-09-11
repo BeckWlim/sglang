@@ -912,6 +912,8 @@ get_results = self._get_batch_zero_copy_impl(
 )
 ```
 
+#### Flat and nested Mooncake destinations
+
 The helper selects the Mooncake API from the pointer shape:
 
 ```python
@@ -922,22 +924,86 @@ if self._uses_multi_buffer(buffer_ptrs):
 return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 ```
 
-The ordinary page-first MHA/GQA path produces one flat pointer per physical K or V object and therefore uses `batch_get_into()`. 
-A nested pointer list means that one object is scattered into several non-contiguous destinations:
+The outer dimension always follows `key_strs`: entry `i` describes the local
+destination for Mooncake object `key_strs[i]`. The difference is whether that
+one destination is contiguous or fragmented.
+
+The flat representation provides one contiguous region per object:
 
 ```text
-key_strs[i]
-    -> buffer_ptrs[i]  = [pointer_i0, pointer_i1, ...]
-    -> buffer_sizes[i] = [size_i0,    size_i1,    ...]
+key_strs     = [key_0, key_1]
+buffer_ptrs  = [ptr_0, ptr_1]
+buffer_sizes = [size_0, size_1]
+
+key_0 -> (ptr_0, size_0)
+key_1 -> (ptr_1, size_1)
 ```
 
-This shape selects `batch_get_into_multi_buffers()`. 
-The buffers are consecutive destination pieces of the same object; 
-the storage lookup and transport model remain the same.
+This shape selects `batch_get_into()`. The ordinary page-first MHA/GQA path,
+for example, produces one flat pointer for each physical K or V object.
+
+The nested representation provides an ordered list of non-contiguous regions
+for each object:
+
+```text
+key_strs = [key_0, key_1]
+
+buffer_ptrs = [
+    [ptr_00, ptr_01, ptr_02],
+    [ptr_10, ptr_11, ptr_12],
+]
+
+buffer_sizes = [
+    [size_00, size_01, size_02],
+    [size_10, size_11, size_12],
+]
+
+key_0 -> [(ptr_00, size_00), (ptr_01, size_01), (ptr_02, size_02)]
+key_1 -> [(ptr_10, size_10), (ptr_11, size_11), (ptr_12, size_12)]
+```
+
+This shape selects `batch_get_into_multi_buffers()`. “Multi-buffer” does not
+mean multiple Mooncake keys: it means one Mooncake object is scattered into
+multiple local memory regions. Mooncake treats the inner regions as ordered
+pieces of that object and builds one transfer slice per piece.
+
+The distinction follows from the Host-pool layout. With page-first MLA, all
+layers belonging to one page are contiguous, so `get_page_buffer_meta()`
+returns one pointer per object. With layer-first MLA, the same logical page is
+split across one region per layer. `_pack_multi_buffer_meta()` groups those
+flat per-layer addresses into one nested pointer row per object before calling
+Mooncake:
+
+```text
+one MLA page object
+    -> layer 0 page region
+    -> layer 1 page region
+    -> ...
+    -> layer N-1 page region
+```
+
+This scatter/gather form lets Mooncake transfer directly into the final L2
+locations without first assembling a temporary contiguous page. The current
+Mooncake adapter supports this layer-first multi-buffer representation for MLA;
+layer-first MHA is rejected because its physical K/V pointer count does not
+match the supported object-key representation.
+
+The flat and multi-buffer paths differ only in destination description. They
+use the same object identities, replica lookup, lease, and transport semantics.
+
+#### Dispatch through `PyClient`
 
 `self.store` is the pybind `MooncakeDistributedStore`. SGLang calls its public
 Python methods; the binding converts integer addresses to `void*`, releases
-the GIL, and dispatches to `RealClient`. The responsibility changes are:
+the GIL, and invokes a virtual method through Mooncake's `PyClient` interface.
+The concrete receiver depends on deployment mode:
+
+| SGLang configuration | `PyClient` implementation in the SGLang process | Next step |
+|---|---|---|
+| `standalone_storage=false` | `RealClient` | Resolve replicas and perform the transfer in-process |
+| `standalone_storage=true` | `DummyClient` | Forward pointers and keys over local IPC/RPC to the external `mooncake_client` process, whose `RealClient` performs the operation |
+
+The normal in-process path is:
 
 ```text
 SGLang batch_get_v1(keys, host_indices)
@@ -946,6 +1012,25 @@ SGLang batch_get_v1(keys, host_indices)
     -> RealClient builds slices over the supplied L2 destinations
     -> BatchGet writes through local copy, TCP, or RDMA into those destinations
 ```
+
+The standalone multi-buffer path adds the proxy hop:
+
+```text
+SGLang process:
+    MooncakeDistributedStore
+        -> DummyClient::batch_get_into_multi_buffers()
+        -> local IPC/RPC
+
+external mooncake_client process:
+    RealClient::batch_get_into_multi_buffers_dummy_helper()
+        -> translate DummyClient addresses to mapped pointers
+        -> RealClient::batch_get_into_multi_buffers_internal()
+        -> BatchQuery + BatchGet
+```
+
+`DummyClient` is therefore a lightweight proxy, not a second storage or
+metadata tier. Its address translation preserves the same flat-versus-nested
+shape before the external `RealClient` performs replica lookup and transfer.
 
 The one-argument `Client::BatchQuery(keys)` is an overload forwarding to the
 tenant-aware overload, not recursion. Flat destinations become contiguous
@@ -961,14 +1046,15 @@ errors. It does not create a worker or transport data itself.
 Sources:
 [`mooncake_store.py:1030-1057`](../../../python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py#L1030),
 [`mooncake_store.py:1306-1313`](../../../python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py#L1306),
-[`store_py.cpp:2743`](</home/xffan2/code/Mooncake/mooncake-integration/store/store_py.cpp:2743>),
-[`store_py.cpp:2911`](</home/xffan2/code/Mooncake/mooncake-integration/store/store_py.cpp:2911>),
-[`real_client.cpp:4328`](</home/xffan2/code/Mooncake/mooncake-store/src/real_client.cpp:4328>),
-[`real_client.cpp:4574`](</home/xffan2/code/Mooncake/mooncake-store/src/real_client.cpp:4574>),
-[`real_client.cpp:5007`](</home/xffan2/code/Mooncake/mooncake-store/src/real_client.cpp:5007>),
-[`real_client.cpp:5040`](</home/xffan2/code/Mooncake/mooncake-store/src/real_client.cpp:5040>),
-[`client_service.cpp:1068`](</home/xffan2/code/Mooncake/mooncake-store/src/client_service.cpp:1068>), and
-[`client_service.cpp:1339`](</home/xffan2/code/Mooncake/mooncake-store/src/client_service.cpp:1339>).
+[`mooncake_store.py:941-997`](../../../python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py#L941),
+[`mla.py:515-553`](../../../python/sglang/srt/mem_cache/pool_host/mla.py#L515),
+[`mha.py:538-598`](../../../python/sglang/srt/mem_cache/pool_host/mha.py#L538),
+[`store_py.cpp:400-417`](</home/xffan2/code/Mooncake/mooncake-integration/store/store_py.cpp:400>),
+[`store_py.cpp:2192-2288`](</home/xffan2/code/Mooncake/mooncake-integration/store/store_py.cpp:2192>),
+[`store_py.cpp:3013-3028`](</home/xffan2/code/Mooncake/mooncake-integration/store/store_py.cpp:3013>),
+[`dummy_client.cpp:1345-1369`](</home/xffan2/code/Mooncake/mooncake-store/src/dummy_client.cpp:1345>),
+[`real_client.cpp:4937-4969`](</home/xffan2/code/Mooncake/mooncake-store/src/real_client.cpp:4937>), and
+[`real_client.cpp:6115-6315`](</home/xffan2/code/Mooncake/mooncake-store/src/real_client.cpp:6115>).
 
 Zero-copy here means that Mooncake writes into the registered SGLang L2 pages instead of returning a separate payload buffer. 
 `Client::BatchGet()` waits for the transfer futures, 
